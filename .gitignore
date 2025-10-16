@@ -1,0 +1,66 @@
+# Track only project structure and source code
+
+# Ignore everything by default
+*
+
+# Allow this file
+!.gitignore
+
+# Allow directory traversal so whitelisted files in subdirs can be included
+!*/
+
+# Whitelist source code files
+!**/*.py
+!**/*.pyi
+!**/*.pyx
+!**/*.pxd
+
+# Whitelist essential project metadata/config (optional)
+!README.md
+!LICENSE
+!requirements.txt
+!pyproject.toml
+!setup.cfg
+!setup.py
+!Pipfile
+!.editorconfig
+
+# Explicitly keep VCS metadata out
+.git/
+
+# Common development artifacts (redundant given the global ignore, kept for clarity)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+.env.*
+
+# Editors/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data, outputs, and large/binary assets remain ignored by default
+# Examples (not strictly needed due to the global ignore):
+data/
+outputs/
+logs/
+*.ipynb
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.csv
+*.tsv
+*.parquet
+*.pt
+*.pth
+*.h5
+
