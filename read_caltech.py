@@ -3,7 +3,7 @@ from typing import Optional
 
 import numpy as np
 
-from datasets.caltech_loader import load_first_sample, CaltechSeqDataset
+from caltech_loader import load_first_sample, CaltechSeqDataset
 
 
 def main() -> None:

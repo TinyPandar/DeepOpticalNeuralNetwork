@@ -7,12 +7,15 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
 
 from scatterNeuralNetwork import ScatterNeuralNetwork
 from caltech_loader import CaltechSeqDataset
+from inria_loader import InriaPersonDataset
+from pennfudan_loader import PennFudanDataset
 
-H_in, W_in = 240, 320
-H_out, W_out = 64, 96
+H_in, W_in = 768, 768
+H_out, W_out = 64, 64
 channels = 3
 
 # Caltech Pedestrians root directory (contains Train/, Test/, annotations/)
@@ -65,12 +68,59 @@ def _pick_and_scale_center(centers: np.ndarray, orig_h: int, orig_w: int) -> tup
     return int(rows[0]), int(cols[0])
 
 
-def caltech_batch_iter(root: str, split: str, batch_size: int, label_filter: str = "person"):
-    """Yield (x_batch [B,3,H_in,W_in], coords_batch [B,2]) batches from Caltech.
-
-    Frames without labels are skipped.
-    """
+def _batch_iter_caltech(root: str, split: str, batch_size: int, label_filter: str = "person"):
+    """Yield batches from Caltech; frames without labels are skipped."""
     ds = CaltechSeqDataset(root, split=split, label_filter=label_filter)
+    imgs, coords = [], []
+    for img_bgr, centers in ds:
+        orig_h, orig_w = img_bgr.shape[:2]
+        rc = _pick_and_scale_center(centers, orig_h, orig_w)
+        if rc is None:
+            continue
+        x1 = _prepare_image_bgr_to_tensor(img_bgr)
+        imgs.append(x1)
+        coords.append(torch.tensor([rc[0], rc[1]]).unsqueeze(0))
+        if len(imgs) == batch_size:
+            x_batch = torch.cat(imgs, dim=0)
+            y_batch = torch.cat(coords, dim=0).long()
+            yield x_batch, y_batch
+            imgs, coords = [], []
+    if imgs:
+        x_batch = torch.cat(imgs, dim=0)
+        y_batch = torch.cat(coords, dim=0).long()
+        yield x_batch, y_batch
+
+
+def _batch_iter_inria(root: str, split: str, batch_size: int):
+    """Yield batches from INRIA; images without boxes are skipped."""
+    ds = InriaPersonDataset(root, split=split, include_negatives=False)
+    imgs, coords = [], []
+    for img_bgr, centers in ds:
+        orig_h, orig_w = img_bgr.shape[:2]
+        rc = _pick_and_scale_center(centers, orig_h, orig_w)
+        if rc is None:
+            continue
+        x1 = _prepare_image_bgr_to_tensor(img_bgr)
+        imgs.append(x1)
+        coords.append(torch.tensor([rc[0], rc[1]]).unsqueeze(0))
+        if len(imgs) == batch_size:
+            x_batch = torch.cat(imgs, dim=0)
+            y_batch = torch.cat(coords, dim=0).long()
+            yield x_batch, y_batch
+            imgs, coords = [], []
+    if imgs:
+        x_batch = torch.cat(imgs, dim=0)
+        y_batch = torch.cat(coords, dim=0).long()
+        yield x_batch, y_batch
+
+
+def _batch_iter_pennfudan(root: str, split: str, batch_size: int):
+    """Yield batches from Penn-Fudan; images without instances are skipped.
+
+    Penn-Fudan has no official Train/Test split. The split arg is ignored but kept
+    for API symmetry.
+    """
+    ds = PennFudanDataset(root, split=split)
     imgs, coords = [], []
     for img_bgr, centers in ds:
         orig_h, orig_w = img_bgr.shape[:2]
@@ -98,11 +148,16 @@ def _compute_intensity(pred: torch.Tensor) -> torch.Tensor:
     return pred
 
 
-def _visualize_epoch_samples(model: ScatterNeuralNetwork, data_root: str, label_filter: str, epoch_index: int, writer: SummaryWriter, vis_samples: int = 6, heatmap_alpha: float = 0.45) -> None:
+def _visualize_epoch_samples(model: ScatterNeuralNetwork, data_root: str, label_filter: str, epoch_index: int, writer: SummaryWriter, vis_samples: int = 6, heatmap_alpha: float = 0.45, dataset: str = "caltech") -> None:
     """Visualize a few labeled training frames and write a figure to TensorBoard."""
     model.eval()
     samples: list[tuple[np.ndarray, np.ndarray]] = []
-    ds = CaltechSeqDataset(data_root, split="Train", label_filter=label_filter)
+    if dataset == "caltech":
+        ds = CaltechSeqDataset(data_root, split="Train", label_filter=label_filter)
+    elif dataset == "inria":
+        ds = InriaPersonDataset(data_root, split="Train", include_negatives=False)
+    else:
+        ds = PennFudanDataset(data_root, split="Train")
     for img_bgr, centers in ds:
         if centers is not None and centers.size > 0:
             samples.append((img_bgr, centers))
@@ -177,6 +232,7 @@ def train_caltech(args) -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.lr))
     writer = SummaryWriter(args.log_dir)
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
     model.train()
     global_step = 0
@@ -185,17 +241,24 @@ def train_caltech(args) -> None:
         epoch_loss_sum = 0.0
         epoch_batch_count = 0
 
-        batch_iter = caltech_batch_iter(DATA_ROOT, split="Train", batch_size=args.batch_size, label_filter=args.label_filter)
+        if args.dataset == "caltech":
+            batch_iter = _batch_iter_caltech(DATA_ROOT, split="Train", batch_size=args.batch_size, label_filter=args.label_filter)
+        elif args.dataset == "inria":
+            batch_iter = _batch_iter_inria(DATA_ROOT, split="Train", batch_size=args.batch_size)
+        else:
+            batch_iter = _batch_iter_pennfudan(DATA_ROOT, split="Train", batch_size=args.batch_size)
         t0 = time.time()
         for b_idx, (x_batch, coords_batch) in enumerate(batch_iter, start=1):
             x_batch = x_batch.to(device)
             coords_batch = coords_batch.to(device)
 
-            optimizer.zero_grad()
-            pred = model(x_batch)
-            loss = pbr_loss(pred, coords_batch)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast("cuda", enabled=(device.type == "cuda")):
+                pred = model(x_batch)
+                loss = pbr_loss(pred, coords_batch)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             writer.add_scalar("train/loss_batch", float(loss.detach().cpu()), global_step)
             global_step += 1
@@ -218,19 +281,25 @@ def train_caltech(args) -> None:
         print(f"[Epoch {epoch}/{args.epochs}] avg_loss={epoch_loss_avg:.6f} batches={epoch_batch_count} time={epoch_time:.1f}s")
         writer.add_scalar("train/loss_epoch", epoch_loss_avg, epoch)
 
-        _visualize_epoch_samples(model, DATA_ROOT, args.label_filter, epoch, writer, vis_samples=args.vis_samples)
+        _visualize_epoch_samples(model, DATA_ROOT, args.label_filter, epoch, writer, vis_samples=args.vis_samples, dataset=args.dataset)
 
         # Evaluation on Test split (average loss)
         model.eval()
         test_loss_sum = 0.0
         test_batch_count = 0
         with torch.no_grad():
-            test_iter = caltech_batch_iter(DATA_ROOT, split="Test", batch_size=args.batch_size, label_filter=args.label_filter)
+            if args.dataset == "caltech":
+                test_iter = _batch_iter_caltech(DATA_ROOT, split="Test", batch_size=args.batch_size, label_filter=args.label_filter)
+            elif args.dataset == "inria":
+                test_iter = _batch_iter_inria(DATA_ROOT, split="Test", batch_size=args.batch_size)
+            else:
+                test_iter = _batch_iter_pennfudan(DATA_ROOT, split="Test", batch_size=args.batch_size)
             for tb_idx, (x_batch, coords_batch) in enumerate(test_iter, start=1):
                 x_batch = x_batch.to(device)
                 coords_batch = coords_batch.to(device)
-                pred = model(x_batch)
-                loss = pbr_loss(pred, coords_batch)
+                with autocast("cuda", enabled=(device.type == "cuda")):
+                    pred = model(x_batch)
+                    loss = pbr_loss(pred, coords_batch)
                 test_loss_sum += float(loss.detach().cpu())
                 test_batch_count += 1
                 if args.max_test_batches > 0 and tb_idx >= args.max_test_batches:
@@ -264,16 +333,17 @@ def train_caltech(args) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ScatterNeuralNetwork on Caltech Pedestrians")
+    parser = argparse.ArgumentParser(description="Train ScatterNeuralNetwork on Caltech/INRIA/PennFudan")
     parser.add_argument("--data_root", type=str, default=DATA_ROOT)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--dataset", type=str, default="pennfudan", choices=["caltech", "inria", "pennfudan"])
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_train_batches", type=int, default=-1, help=">0 to limit batches per epoch; -1 for full")
     parser.add_argument("--max_test_batches", type=int, default=100, help=">0 to limit test batches per epoch; -1 for full")
     parser.add_argument("--vis_samples", type=int, default=6)
     parser.add_argument("--label_filter", type=str, default="person")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--device", type=str, default=("cuda:1" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--log_dir", type=str, default=os.path.join(os.path.abspath(os.getcwd()), "runs", "caltech_full"))
     parser.add_argument("--ckpt_dir", type=str, default=os.path.join(os.path.abspath(os.getcwd()), "checkpoints", "caltech_full"))
     parser.add_argument("--h_in", type=int, default=H_in)
@@ -286,9 +356,10 @@ def main():
         args.max_train_batches = 0
     if args.max_test_batches < 0:
         args.max_test_batches = 0
-    # Append timestamp to log_dir to avoid overwriting previous runs
+    # Organize outputs by dataset and timestamp to avoid collisions
     ts = time.strftime("%Y%m%d-%H%M%S")
-    args.log_dir = os.path.join(args.log_dir, ts)
+    args.log_dir = os.path.join(args.log_dir, args.dataset, ts)
+    args.ckpt_dir = os.path.join(args.ckpt_dir, args.dataset, ts)
     print(f"TensorBoard logdir: {args.log_dir}")
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)

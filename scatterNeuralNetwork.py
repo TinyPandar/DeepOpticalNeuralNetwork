@@ -92,7 +92,8 @@ class ScatterNeuralNetwork(nn.Module):
         in_dim = self.height * self.width
 
         # 可学习的逐像素相位（在 batch 维度上广播），单位：弧度
-        phase = torch.empty(1, 1, self.height, self.width, device=device, dtype=torch.float32 if dtype is None else torch.float32)
+        # 使用 float32 存储相位，避免 torch.polar 在半精度上的算子缺失
+        phase = torch.empty(1, 1, self.height, self.width, device=device, dtype=torch.float32)
         if phase_init == "zeros":
             nn.init.zeros_(phase)
         elif phase_init == "uniform":
@@ -108,6 +109,7 @@ class ScatterNeuralNetwork(nn.Module):
         else:
             gen = None
 
+        # 用半精度生成实部/虚部，从而构成 complex32 的传输矩阵
         real = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
         imag = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
 
@@ -116,7 +118,8 @@ class ScatterNeuralNetwork(nn.Module):
         real = real * scale
         imag = imag * scale
 
-        transmission_matrix = torch.complex(real, imag).to(torch.complex64 if dtype is None else torch.complex64)
+        # 固定使用 complex64（cfloat）存储传输矩阵
+        transmission_matrix = torch.complex(real, imag).to(torch.complex64)
         self.register_buffer("transmission_matrix", transmission_matrix, persistent=True)
 
     @torch.no_grad()
@@ -132,6 +135,7 @@ class ScatterNeuralNetwork(nn.Module):
             gen.manual_seed(int(seed))
         else:
             gen = None
+        # 重置时保持与当前缓冲区一致（此处为 complex64 → 实/虚为 float32）
         real = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
         imag = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
         scale = float(tmatrix_scale) / math.sqrt(in_dim)
@@ -221,14 +225,25 @@ class ScatterNeuralNetwork(nn.Module):
 
         # 构建复数场：amplitude * exp(i * phase)
         # polar(abs, angle) -> complex
-        field_complex = torch.polar(amplitude, self.phase)  # [B, 1, H, W], complex
+        # torch.polar 对 half CUDA 未实现，这里在极坐标构造处用 float32，然后再按需降精度
+        field_complex = torch.polar(amplitude.float(), self.phase)  # [B, 1, H, W], complex64
+        # 若传输矩阵为 complex32，则将场降到 complex32 以节省显存
+        if self.transmission_matrix.dtype == getattr(torch, "complex32", torch.complex64):
+            field_complex = field_complex.to(getattr(torch, "complex32", torch.complex64))
 
         # 展平空间维度
         b = field_complex.shape[0]
         field_vec = field_complex.reshape(b, -1)  # [B, H*W], complex
 
-        # 与传输矩阵相乘：[B, in_dim] @ [in_dim, out_dim] -> [B, out_dim]
-        y = field_vec @ self.transmission_matrix.transpose(0, 1)  # complex
+        # 避免 ComplexHalf 矩阵乘法：分离实部/虚部，用实数 matmul 组合
+        tm = self.transmission_matrix
+        tm_real = tm.real
+        tm_imag = tm.imag
+        fv_real = field_vec.real.to(tm_real.dtype)
+        fv_imag = field_vec.imag.to(tm_real.dtype)
+        y_real = fv_real @ tm_real.transpose(0, 1) - fv_imag @ tm_imag.transpose(0, 1)
+        y_imag = fv_real @ tm_imag.transpose(0, 1) + fv_imag @ tm_real.transpose(0, 1)
+        y = torch.complex(y_real, y_imag).to(tm.dtype)
 
         if self.return_intensity:
             # 强度：|y|^2 = real^2 + imag^2，然后重塑为二维输出

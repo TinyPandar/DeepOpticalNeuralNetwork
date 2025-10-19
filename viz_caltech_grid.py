@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from caltech_loader import CaltechSeqDataset
+from inria_loader import InriaPersonDataset
 
 
 def draw_centers(image: np.ndarray, centers: np.ndarray, color: Tuple[int, int, int] = (0, 255, 0)) -> np.ndarray:
@@ -35,7 +36,11 @@ def make_grid(images: List[np.ndarray], rows: int = 3, cols: int = 3) -> np.ndar
 
 def main() -> None:
     root = "/home/limingfei/speckle/donn/datasets/caltectPedestrains"
-    ds = CaltechSeqDataset(root, split="Train", set_id=0, video_id=1, label_filter="people")
+    use_inria = False
+    if use_inria:
+        ds = InriaPersonDataset(root, split="Train", include_negatives=False)
+    else:
+        ds = CaltechSeqDataset(root, split="Train", set_id=0, video_id=1, label_filter="people")
 
     annotated: List[np.ndarray] = []
     for i, (img, centers) in enumerate(ds):
