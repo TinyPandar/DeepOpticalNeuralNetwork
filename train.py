@@ -2,6 +2,8 @@ import os
 import time
 import argparse
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 import numpy as np
 import cv2
@@ -215,7 +217,18 @@ def _visualize_epoch_samples(model: ScatterNeuralNetwork, data_root: str, label_
 
 
 def train_caltech(args) -> None:
-    device = torch.device(args.device)
+    # Distributed init
+    is_dist = False
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        is_dist = True
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
 
     # Allow overriding global input/output sizes for helper functions
     global H_in, W_in, H_out, W_out, DATA_ROOT
@@ -223,16 +236,45 @@ def train_caltech(args) -> None:
     H_out, W_out = int(args.h_out), int(args.w_out)
     DATA_ROOT = args.data_root
 
+    # Map CLI dtype to torch dtype for transmission-matrix compute path
+    if args.tmatrix_compute_dtype == "fp32":
+        tmatrix_compute_dtype = None  # use complex64 direct matmul
+    elif args.tmatrix_compute_dtype == "bf16":
+        tmatrix_compute_dtype = torch.bfloat16
+    else:
+        tmatrix_compute_dtype = torch.float16
+
+    # Enable tensor-parallel shards inside model when running distributed
+    tp_enabled = bool(args.tp and (world_size > 1))
     model = ScatterNeuralNetwork(
         input_hw=(H_in, W_in),
         output_hw=(H_out, W_out),
         return_intensity=False,
+        num_layers=int(args.num_layers),
         seed=42,
+        tmatrix_compute_dtype=tmatrix_compute_dtype,
+        tp_enabled=tp_enabled,
+        tp_rank=(local_rank if tp_enabled else 0),
+        tp_world_size=(world_size if tp_enabled else 1),
     ).to(device)
 
+    if is_dist:
+        # Don't broadcast buffers (each rank holds different shard)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+        )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.lr))
-    writer = SummaryWriter(args.log_dir)
-    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    # rank0 only logging
+    is_rank0 = (not is_dist) or (dist.get_rank() == 0)
+    writer = SummaryWriter(args.log_dir) if is_rank0 else None
+    # Enable GradScaler only when actually using fp16 compute; it's not needed for bf16/fp32
+    use_fp16 = (device.type == "cuda" and args.tmatrix_compute_dtype == "fp16")
+    scaler = GradScaler("cuda", enabled=use_fp16)
 
     model.train()
     global_step = 0
@@ -249,39 +291,58 @@ def train_caltech(args) -> None:
             batch_iter = _batch_iter_pennfudan(DATA_ROOT, split="Train", batch_size=args.batch_size)
         t0 = time.time()
         for b_idx, (x_batch, coords_batch) in enumerate(batch_iter, start=1):
-            x_batch = x_batch.to(device)
-            coords_batch = coords_batch.to(device)
+            # Broadcast batch from rank0 so each rank sees same data
+            x_batch = x_batch.to(device, non_blocking=True)
+            coords_batch = coords_batch.to(device, non_blocking=True)
+            if is_dist:
+                dist.broadcast(x_batch, src=0)
+                dist.broadcast(coords_batch, src=0)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast("cuda", enabled=(device.type == "cuda")):
+            # 根据传输矩阵计算精度设置 autocast，避免复数 matmul 的精度不匹配
+            if args.tmatrix_compute_dtype == "fp32":
+                ac_enabled = False
+                ac_dtype = None
+            elif args.tmatrix_compute_dtype == "bf16":
+                ac_enabled = (device.type == "cuda")
+                ac_dtype = torch.bfloat16
+            else:
+                ac_enabled = (device.type == "cuda")
+                ac_dtype = torch.float16
+
+            with autocast("cuda", enabled=ac_enabled, dtype=ac_dtype if ac_enabled else None):
                 pred = model(x_batch)
                 loss = pbr_loss(pred, coords_batch)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            writer.add_scalar("train/loss_batch", float(loss.detach().cpu()), global_step)
+            if writer is not None:
+                writer.add_scalar("train/loss_batch", float(loss.detach().cpu()), global_step)
             global_step += 1
 
             epoch_loss_sum += float(loss.detach().cpu())
             epoch_batch_count += 1
 
-            if b_idx % 20 == 0:
+            if is_rank0 and b_idx % 20 == 0:
                 print(f"epoch {epoch:02d} batch {b_idx:04d} loss {loss.item():.6f}")
 
             if args.max_train_batches > 0 and b_idx >= args.max_train_batches:
                 break
 
         epoch_time = time.time() - t0
-        if epoch_batch_count == 0:
+        if epoch_batch_count == 0 and is_rank0:
             print(f"epoch {epoch} has no batches; check dataset and filters.")
             continue
 
         epoch_loss_avg = epoch_loss_sum / epoch_batch_count
-        print(f"[Epoch {epoch}/{args.epochs}] avg_loss={epoch_loss_avg:.6f} batches={epoch_batch_count} time={epoch_time:.1f}s")
-        writer.add_scalar("train/loss_epoch", epoch_loss_avg, epoch)
+        if is_rank0:
+            print(f"[Epoch {epoch}/{args.epochs}] avg_loss={epoch_loss_avg:.6f} batches={epoch_batch_count} time={epoch_time:.1f}s")
+            if writer is not None:
+                writer.add_scalar("train/loss_epoch", epoch_loss_avg, epoch)
 
-        _visualize_epoch_samples(model, DATA_ROOT, args.label_filter, epoch, writer, vis_samples=args.vis_samples, dataset=args.dataset)
+        if is_rank0 and writer is not None:
+            _visualize_epoch_samples(model.module if isinstance(model, DDP) else model, DATA_ROOT, args.label_filter, epoch, writer, vis_samples=args.vis_samples, dataset=args.dataset)
 
         # Evaluation on Test split (average loss)
         model.eval()
@@ -295,9 +356,21 @@ def train_caltech(args) -> None:
             else:
                 test_iter = _batch_iter_pennfudan(DATA_ROOT, split="Test", batch_size=args.batch_size)
             for tb_idx, (x_batch, coords_batch) in enumerate(test_iter, start=1):
-                x_batch = x_batch.to(device)
-                coords_batch = coords_batch.to(device)
-                with autocast("cuda", enabled=(device.type == "cuda")):
+                x_batch = x_batch.to(device, non_blocking=True)
+                coords_batch = coords_batch.to(device, non_blocking=True)
+                if is_dist:
+                    dist.broadcast(x_batch, src=0)
+                    dist.broadcast(coords_batch, src=0)
+                if args.tmatrix_compute_dtype == "fp32":
+                    ac_enabled = False
+                    ac_dtype = None
+                elif args.tmatrix_compute_dtype == "bf16":
+                    ac_enabled = (device.type == "cuda")
+                    ac_dtype = torch.bfloat16
+                else:
+                    ac_enabled = (device.type == "cuda")
+                    ac_dtype = torch.float16
+                with autocast("cuda", enabled=ac_enabled, dtype=ac_dtype if ac_enabled else None):
                     pred = model(x_batch)
                     loss = pbr_loss(pred, coords_batch)
                 test_loss_sum += float(loss.detach().cpu())
@@ -307,29 +380,37 @@ def train_caltech(args) -> None:
 
         if test_batch_count > 0:
             test_loss_avg = test_loss_sum / test_batch_count
-            print(f"[Epoch {epoch}/{args.epochs}] test_avg_loss={test_loss_avg:.6f} over {test_batch_count} batches")
-            writer.add_scalar("test/loss_epoch", test_loss_avg, epoch)
+            if is_rank0:
+                print(f"[Epoch {epoch}/{args.epochs}] test_avg_loss={test_loss_avg:.6f} over {test_batch_count} batches")
+                if writer is not None:
+                    writer.add_scalar("test/loss_epoch", test_loss_avg, epoch)
         else:
-            print("No test batches produced (check Test split labels/filter).")
+            if is_rank0:
+                print("No test batches produced (check Test split labels/filter).")
 
         # Save checkpoint at the end of each epoch
-        ckpt = {
+        if is_rank0:
+            ckpt = {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": (model.module if isinstance(model, DDP) else model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "train_loss_avg": epoch_loss_avg,
             "test_loss_avg": (test_loss_sum / test_batch_count) if test_batch_count > 0 else None,
             "args": vars(args),
-        }
-        os.makedirs(args.ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(args.ckpt_dir, f"epoch_{epoch:03d}.pth")
-        torch.save(ckpt, ckpt_path)
-        print(f"Saved checkpoint to: {ckpt_path}")
+            }
+            os.makedirs(args.ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(args.ckpt_dir, f"epoch_{epoch:03d}.pth")
+            torch.save(ckpt, ckpt_path)
+            print(f"Saved checkpoint to: {ckpt_path}")
 
         model.train()
 
-    writer.flush()
-    writer.close()
+    if writer is not None:
+        writer.flush()
+        writer.close()
+    if is_dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():
@@ -343,13 +424,16 @@ def main():
     parser.add_argument("--vis_samples", type=int, default=6)
     parser.add_argument("--label_filter", type=str, default="person")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--device", type=str, default=("cuda:1" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--device", type=str, default=("cuda:0" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--log_dir", type=str, default=os.path.join(os.path.abspath(os.getcwd()), "runs", "caltech_full"))
     parser.add_argument("--ckpt_dir", type=str, default=os.path.join(os.path.abspath(os.getcwd()), "checkpoints", "caltech_full"))
     parser.add_argument("--h_in", type=int, default=H_in)
     parser.add_argument("--w_in", type=int, default=W_in)
     parser.add_argument("--h_out", type=int, default=H_out)
     parser.add_argument("--w_out", type=int, default=W_out)
+    parser.add_argument("--num_layers", type=int, default=1, help="Times to apply (phase->TM->abs) per forward")
+    parser.add_argument("--tmatrix_compute_dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"], help="Compute dtype for transmission matmul; fp32 uses complex64 direct matmul")
+    parser.add_argument("--tp", action="store_true", help="Enable tensor-parallel sharded transmission matrix across world_size GPUs")
     args = parser.parse_args()
 
     if args.max_train_batches < 0:

@@ -11,6 +11,7 @@
 -------
 ```python
 import torch
+import torch.distributed as dist
 from scatterNeuralNetwork import ScatterNeuralNetwork
 
 H_in, W_in = 128, 128
@@ -28,7 +29,47 @@ import math
 from typing import Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _TPAllGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, y_local: torch.Tensor, rows_per_rank: int, output_dim: int, world_size: int) -> torch.Tensor:
+        ctx.rows_per_rank = int(rows_per_rank)
+        ctx.output_dim = int(output_dim)
+        ctx.world_size = int(world_size)
+        # Pad local columns to rows_per_rank for even concat
+        B = y_local.shape[0]
+        local_cols = y_local.shape[1]
+        ctx.local_cols = int(local_cols)
+        pad_cols = rows_per_rank - local_cols
+        if pad_cols > 0:
+            pad = torch.zeros(B, pad_cols, dtype=y_local.dtype, device=y_local.device)
+            y_pad = torch.cat([y_local, pad], dim=1)
+        else:
+            y_pad = y_local
+        # Gather real/imag separately for safety
+        y_r = y_pad.real.contiguous()
+        y_i = y_pad.imag.contiguous()
+        gather_r = [torch.empty_like(y_r) for _ in range(world_size)]
+        gather_i = [torch.empty_like(y_i) for _ in range(world_size)]
+        dist.all_gather(gather_r, y_r)
+        dist.all_gather(gather_i, y_i)
+        y_full_r = torch.cat(gather_r, dim=1)[:, :output_dim]
+        y_full_i = torch.cat(gather_i, dim=1)[:, :output_dim]
+        return torch.complex(y_full_r, y_full_i)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if not dist.is_available() or not dist.is_initialized() or ctx.world_size == 1:
+            return grad_output, None, None, None
+        rank = dist.get_rank()
+        start = rank * ctx.rows_per_rank
+        end = min(start + ctx.rows_per_rank, ctx.output_dim)
+        grad_local = grad_output[:, start:end]
+        return grad_local, None, None, None
 
 
 class ScatterNeuralNetwork(nn.Module):
@@ -52,6 +93,9 @@ class ScatterNeuralNetwork(nn.Module):
         在区间 [0, 2π) 上均匀初始化。
     tmatrix_scale:
         在按 sqrt(in_dim) 归一化之前，用于实部/虚部正态初始化的标准差缩放因子。
+    tmatrix_compute_dtype:
+        传输计算时使用的实数精度（用于分解为实/虚两路 matmul 的路径）。
+        可为 None/torch.float16/torch.bfloat16；为 None 时使用复数 matmul（complex64）。
     seed:
         可选的随机数种子，用于确定性地初始化传输矩阵。
     device, dtype:
@@ -68,9 +112,16 @@ class ScatterNeuralNetwork(nn.Module):
         return_intensity: bool = False,
         phase_init: str = "uniform",
         tmatrix_scale: float = 1.0,
+        tmatrix_compute_dtype: Optional[torch.dtype] = None,
+        num_layers: int = 1,
         seed: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        # Tensor-parallel options
+        tp_enabled: bool = False,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
+        
     ) -> None:
         super().__init__()
 
@@ -88,37 +139,63 @@ class ScatterNeuralNetwork(nn.Module):
         self.sqrt_amplitude = bool(sqrt_amplitude)
         self.return_intensity = bool(return_intensity)
         self.eps: float = 1e-8
+        # 前向传播重复层数（相位调制+传输+幅度更新的次数）
+        if not isinstance(num_layers, int) or num_layers <= 0:
+            raise ValueError("num_layers must be a positive integer")
+        self.num_layers: int = int(num_layers)
 
         in_dim = self.height * self.width
 
+        # 设置传输矩阵的计算精度（仅影响前向中的 matmul 计算，不改变存储精度）
+        if tmatrix_compute_dtype is not None and tmatrix_compute_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("tmatrix_compute_dtype must be one of {None, torch.float16, torch.bfloat16}")
+        self.tmatrix_compute_dtype: Optional[torch.dtype] = tmatrix_compute_dtype
+
+        # Tensor parallel config
+        self.tp_enabled: bool = bool(tp_enabled and (tp_world_size or 1) > 1)
+        self.tp_rank: int = int(tp_rank)
+        self.tp_world_size: int = int(tp_world_size) if int(tp_world_size) > 0 else 1
+        # 每 rank 均分行数（最后一块可能更短）；用于 all_gather 时对齐 padding
+        self.rows_per_rank: int = (self.output_dim + self.tp_world_size - 1) // max(self.tp_world_size, 1)
+        if self.tp_enabled:
+            start = self.tp_rank * self.rows_per_rank
+            end = min(start + self.rows_per_rank, self.output_dim)
+        else:
+            start, end = 0, self.output_dim
+        self._row_start: int = start
+        self._row_end: int = end
+
         # 可学习的逐像素相位（在 batch 维度上广播），单位：弧度
         # 使用 float32 存储相位，避免 torch.polar 在半精度上的算子缺失
-        phase = torch.empty(1, 1, self.height, self.width, device=device, dtype=torch.float32)
+        phase = torch.empty(1, 1, self.height * self.width, device=device, dtype=torch.float32)
         if phase_init == "zeros":
             nn.init.zeros_(phase)
         elif phase_init == "uniform":
             nn.init.uniform_(phase, a=0.0, b=2.0 * math.pi)
         else:
             raise ValueError("phase_init must be one of {'zeros', 'uniform'}")
-        self.phase = nn.Parameter(phase)  # shape [1, 1, H, W]
+        self.phase = nn.Parameter(phase)  # shape [1, 1, H*W]
 
-        # 作为 buffer 注册的固定随机复数传输矩阵
+        # 作为 buffer 注册的固定随机复数传输矩阵（或其本地 shard）
         if seed is not None:
             gen = torch.Generator(device=device)
-            gen.manual_seed(int(seed))
+            # 不同 rank 使用不同 seed，确保 shard 可复现
+            rank_seed = int(seed) + int(self.tp_rank)
+            gen.manual_seed(rank_seed)
         else:
             gen = None
 
-        # 用半精度生成实部/虚部，从而构成 complex32 的传输矩阵
-        real = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
-        imag = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
+        local_rows = self._row_end - self._row_start
+        # 生成本地 shard 的实部/虚部（float32），随后与 in_dim 缩放以保持方差尺度，再组成 complex64 存储
+        real = torch.randn(local_rows, in_dim, generator=gen, device=device, dtype=torch.float32)
+        imag = torch.randn(local_rows, in_dim, generator=gen, device=device, dtype=torch.float32)
 
         # 用 in_dim 归一化方差以保持数值尺度合理
         scale = float(tmatrix_scale) / math.sqrt(in_dim)
         real = real * scale
         imag = imag * scale
 
-        # 固定使用 complex64（cfloat）存储传输矩阵
+        # 固定使用 complex64（cfloat）存储传输矩阵（计算时可按需降精度到 fp16/bf16 实数）
         transmission_matrix = torch.complex(real, imag).to(torch.complex64)
         self.register_buffer("transmission_matrix", transmission_matrix, persistent=True)
 
@@ -132,12 +209,14 @@ class ScatterNeuralNetwork(nn.Module):
         device = self.transmission_matrix.device
         if seed is not None:
             gen = torch.Generator(device=device)
-            gen.manual_seed(int(seed))
+            rank_seed = int(seed) + int(self.tp_rank)
+            gen.manual_seed(rank_seed)
         else:
             gen = None
-        # 重置时保持与当前缓冲区一致（此处为 complex64 → 实/虚为 float32）
-        real = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
-        imag = torch.randn(self.output_dim, in_dim, generator=gen, device=device, dtype=torch.float32)
+        # 重置当前 rank 的 shard（此处为 complex64 → 实/虚为 float32）
+        local_rows = self._row_end - self._row_start
+        real = torch.randn(local_rows, in_dim, generator=gen, device=device, dtype=torch.float32)
+        imag = torch.randn(local_rows, in_dim, generator=gen, device=device, dtype=torch.float32)
         scale = float(tmatrix_scale) / math.sqrt(in_dim)
         real = real * scale
         imag = imag * scale
@@ -223,27 +302,60 @@ class ScatterNeuralNetwork(nn.Module):
         B, C, H, W = x.shape
         amplitude = self._image_to_amplitude(x)  # [B, 1, H, W]
 
-        # 构建复数场：amplitude * exp(i * phase)
-        # polar(abs, angle) -> complex
-        # torch.polar 对 half CUDA 未实现，这里在极坐标构造处用 float32，然后再按需降精度
-        field_complex = torch.polar(amplitude.float(), self.phase)  # [B, 1, H, W], complex64
-        # 若传输矩阵为 complex32，则将场降到 complex32 以节省显存
-        if self.transmission_matrix.dtype == getattr(torch, "complex32", torch.complex64):
-            field_complex = field_complex.to(getattr(torch, "complex32", torch.complex64))
+        for l in range(self.num_layers):
+            # 展平空间维度
+            b = amplitude.shape[0]
+            amplitude = amplitude.reshape(b, -1)  # [B, H*W], complex
 
-        # 展平空间维度
-        b = field_complex.shape[0]
-        field_vec = field_complex.reshape(b, -1)  # [B, H*W], complex
+            # 构建复数场：amplitude * exp(i * phase)
+            # polar(abs, angle) -> complex
+            # torch.polar 对 half CUDA 未实现，这里在极坐标构造处用 float32，然后再按需降精度
+            # 构造复数场，确保为二维 [B, H*W]
+            field_vec = torch.polar(amplitude.float(), self.phase.view(1, -1))  # complex64 [B, H*W]
+            # 若传输矩阵为 complex32，则将场降到 complex32 以节省显存
+            if self.transmission_matrix.dtype == getattr(torch, "complex32", torch.complex64):
+                field_vec = field_vec.to(getattr(torch, "complex32", torch.complex64))
 
-        # 避免 ComplexHalf 矩阵乘法：分离实部/虚部，用实数 matmul 组合
-        tm = self.transmission_matrix
-        tm_real = tm.real
-        tm_imag = tm.imag
-        fv_real = field_vec.real.to(tm_real.dtype)
-        fv_imag = field_vec.imag.to(tm_real.dtype)
-        y_real = fv_real @ tm_real.transpose(0, 1) - fv_imag @ tm_imag.transpose(0, 1)
-        y_imag = fv_real @ tm_imag.transpose(0, 1) + fv_imag @ tm_real.transpose(0, 1)
-        y = torch.complex(y_real, y_imag).to(tm.dtype)
+
+
+            # 复数矩阵乘法：
+            # - 若未指定 tmatrix_compute_dtype，则直接用复数 matmul（complex64）
+            # - 否则分解为实/虚两次实数 matmul，并在所选 dtype 下计算，以避免精度不匹配
+            tm = self.transmission_matrix  # [local_rows, in_dim] 或 [output_dim, in_dim]
+            if self.tmatrix_compute_dtype is None:
+                y_local = field_vec @ tm.transpose(0, 1)  # [B, local_rows]
+            else:
+                rdtype = self.tmatrix_compute_dtype
+                x_r = field_vec.real.to(rdtype)
+                x_i = field_vec.imag.to(rdtype)
+                tm_r = tm.real.to(rdtype)
+                tm_i = tm.imag.to(rdtype)
+                y_real = x_r @ tm_r.transpose(0, 1) - x_i @ tm_i.transpose(0, 1)
+                y_imag = x_r @ tm_i.transpose(0, 1) + x_i @ tm_r.transpose(0, 1)
+                y_local = torch.complex(y_real.to(torch.float32), y_imag.to(torch.float32))
+
+            # 张量并行：使用自定义 autograd-safe all_gather 组装完整输出
+            if self.tp_enabled and dist.is_available() and dist.is_initialized() and self.tp_world_size > 1:
+                y = _TPAllGather.apply(
+                    y_local,
+                    self.rows_per_rank,
+                    self.output_dim,
+                    self.tp_world_size,
+                )
+            else:
+                y = y_local
+
+            amplitude = torch.abs(y)
+            # 重新调整为 [B, 1, H_in, W_in] 以便作为下一层的输入幅度
+            amplitude = amplitude.view(b, self.output_height, self.output_width).unsqueeze(1)
+            if (self.output_height, self.output_width) != (self.height, self.width):
+                amplitude = F.interpolate(
+                    amplitude,
+                    size=(self.height, self.width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            
 
         if self.return_intensity:
             # 强度：|y|^2 = real^2 + imag^2，然后重塑为二维输出
