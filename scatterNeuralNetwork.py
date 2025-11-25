@@ -32,6 +32,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from OGN.modules import FreeSpaceProp
+from OpticalConvLayer import OpticalConvLayer   
+from TiledConvLayer import TiledConvLayer
 
 
 class _TPAllGather(torch.autograd.Function):
@@ -100,6 +103,13 @@ class ScatterNeuralNetwork(nn.Module):
         可选的随机数种子，用于确定性地初始化传输矩阵。
     device, dtype:
         可选的 torch 设备与 dtype，应用于参数/缓冲区。
+    activation:
+        激活函数类型，可选值：{"abs", "relu", "leaky_relu", "sigmoid", "tanh", "elu", "softplus"}。
+        默认为 "abs"（绝对值函数）。
+    activation_params:
+        激活函数的参数字典，例如 {"negative_slope": 0.01} 用于 LeakyReLU。
+    normalize_negative:
+        若为 True，对激活函数输出的负数部分进行正则化处理。
     """
 
     def __init__(
@@ -121,6 +131,10 @@ class ScatterNeuralNetwork(nn.Module):
         tp_enabled: bool = False,
         tp_rank: int = 0,
         tp_world_size: int = 1,
+        # 激活函数选项
+        activation: str = "none",
+        activation_params: Optional[dict] = None,
+        normalize_negative: bool = False,
         
     ) -> None:
         super().__init__()
@@ -144,6 +158,14 @@ class ScatterNeuralNetwork(nn.Module):
             raise ValueError("num_layers must be a positive integer")
         self.num_layers: int = int(num_layers)
 
+        # 激活函数配置
+        valid_activations = {"abs", "relu", "leaky_relu", "sigmoid", "tanh", "elu", "softplus", "none"}
+        if activation not in valid_activations:
+            raise ValueError(f"activation must be one of {valid_activations}, but got '{activation}'")
+        self.activation: str = activation
+        self.activation_params: dict = activation_params or {}
+        self.normalize_negative: bool = bool(normalize_negative)
+
         in_dim = self.height * self.width
 
         # 设置传输矩阵的计算精度（仅影响前向中的 matmul 计算，不改变存储精度）
@@ -166,15 +188,19 @@ class ScatterNeuralNetwork(nn.Module):
         self._row_end: int = end
 
         # 可学习的逐像素相位（在 batch 维度上广播），单位：弧度
-        # 使用 float32 存储相位，避免 torch.polar 在半精度上的算子缺失
-        phase = torch.empty(1, 1, self.height * self.width, device=device, dtype=torch.float32)
-        if phase_init == "zeros":
-            nn.init.zeros_(phase)
-        elif phase_init == "uniform":
-            nn.init.uniform_(phase, a=0.0, b=2.0 * math.pi)
-        else:
-            raise ValueError("phase_init must be one of {'zeros', 'uniform'}")
-        self.phase = nn.Parameter(phase)  # shape [1, 1, H*W]
+        # 为每一层分配独立的相位参数；使用 float32 存储以避免半精度构造复数的不支持
+        phases: list = []
+        for _ in range(self.num_layers):
+            # 采用二维相位形状，便于与 [B, 1, H, W] 的幅度直接广播
+            phase_l = torch.empty(1, 1, self.height, self.width, device=device, dtype=torch.float32)
+            if phase_init == "zeros":
+                nn.init.zeros_(phase_l)
+            elif phase_init == "uniform":
+                nn.init.uniform_(phase_l, a=0.0, b=2.0 * math.pi)
+            else:
+                raise ValueError("phase_init must be one of {'zeros', 'uniform'}")
+            phases.append(nn.Parameter(phase_l))
+        self.phases = nn.ParameterList(phases)  # 每层一个形状为 [1, 1, H, W] 的相位参数
 
         # 作为 buffer 注册的固定随机复数传输矩阵（或其本地 shard）
         if seed is not None:
@@ -198,6 +224,32 @@ class ScatterNeuralNetwork(nn.Module):
         # 固定使用 complex64（cfloat）存储传输矩阵（计算时可按需降精度到 fp16/bf16 实数）
         transmission_matrix = torch.complex(real, imag).to(torch.complex64)
         self.register_buffer("transmission_matrix", transmission_matrix, persistent=True)
+
+        # self.prop1 = FreeSpaceProp(wlength_vc=5.2e-7, 
+        #                                 ridx_air=1.0,
+        #                                 total_x_num=self.height, total_y_num=self.width,
+        #                                 dx=8e-6, dy=8e-6,
+        #                                 prop_z= 0.05)
+
+        # self.prop2 = FreeSpaceProp(wlength_vc=5.2e-7, 
+        #                                 ridx_air=1.0,
+        #                                 total_x_num=self.output_height, total_y_num=self.output_width,
+        #                                 dx=8e-6 , dy=8e-6 ,
+        #                                 prop_z= 0.01)
+        tiling = 2     # 3x3 阵列
+        tile_sz = 400    # 拼接后每个块 64x64
+        kern_sz = 5    # 实际可训练区域 50x50
+        # self.conv = OpticalConvLayer(
+        #                                 coherent=True,          # 使用干涉
+        #                                 amplitude_mask=False,   # 相位调制元件
+        #                                 r_NA=0.8, wavelength=633e-9,
+        #                                 activation=torch.relu
+        #                             )
+        self.conv1 = TiledConvLayer(tiling_factor=tiling, tile_size=tile_sz, kernel_size=kern_sz, nonneg=True)
+        self.conv2 = TiledConvLayer(tiling_factor=tiling, tile_size=tile_sz, kernel_size=kern_sz, nonneg=True)
+        self.conv3 = TiledConvLayer(tiling_factor=tiling, tile_size=tile_sz, kernel_size=kern_sz, nonneg=True)
+        self.conv4 = TiledConvLayer(tiling_factor=tiling, tile_size=tile_sz, kernel_size=kern_sz, nonneg=True)
+        self.conv5 = TiledConvLayer(tiling_factor=tiling, tile_size=tile_sz, kernel_size=kern_sz, nonneg=True)
 
     @torch.no_grad()
     def reset_transmission_matrix(self, *, seed: Optional[int] = None, tmatrix_scale: float = 1.0) -> None:
@@ -285,6 +337,91 @@ class ScatterNeuralNetwork(nn.Module):
 
         return amp  # 形状 [B, 1, H, W]，实数
 
+    def _apply_activation(self, y: torch.Tensor) -> torch.Tensor:
+        """应用选择的激活函数到复数输出 y。
+        
+        参数
+        ----------
+        y:
+            复数张量，形状为 [B, 1, H, W]
+            
+        返回
+        -------
+        torch.Tensor
+            实数张量，形状为 [B, 1, H, W]
+        """
+        # 获取幅度作为基础值
+        amplitude = torch.abs(y)**2
+        
+        # 根据选择的激活函数进行处理
+        if self.activation == "abs":
+            return amplitude
+            
+        elif self.activation == "relu":
+            return F.relu(amplitude)
+            
+        elif self.activation == "leaky_relu":
+            negative_slope = self.activation_params.get("negative_slope", 0.01)
+            return F.leaky_relu(amplitude, negative_slope=negative_slope)
+            
+        elif self.activation == "sigmoid":
+            return torch.sigmoid(amplitude)
+            
+        elif self.activation == "tanh":
+            return torch.tanh(amplitude)
+            
+        elif self.activation == "elu":
+            alpha = self.activation_params.get("alpha", 1.0)
+            return F.elu(amplitude, alpha=alpha)
+            
+        elif self.activation == "softplus":
+            beta = self.activation_params.get("beta", 1.0)
+            threshold = self.activation_params.get("threshold", 20.0)
+            return F.softplus(amplitude, beta=beta, threshold=threshold)
+        
+        else:
+            # 默认使用绝对值
+            return amplitude
+
+    def _normalize_negative_values(self, amplitude: torch.Tensor) -> torch.Tensor:
+        """对激活函数输出的负数部分进行正则化处理。
+        
+        参数
+        ----------
+        amplitude:
+            实数张量，可能包含负数
+            
+        返回
+        -------
+        torch.Tensor
+            正则化后的实数张量，所有值都非负
+        """
+        # 找到负数部分
+        negative_mask = amplitude < 0
+        
+        if not negative_mask.any():
+            # 如果没有负数，直接返回
+            return amplitude
+            
+        # 对负数部分进行正则化处理
+        # 方法1：将负数映射到正数范围（例如使用绝对值）
+        # 方法2：将负数缩放到 [0, 1] 范围
+        # 这里使用方法2：将整个张量缩放到 [0, 1] 范围
+        
+        # 获取最小值和最大值
+        min_val = amplitude.min()
+        max_val = amplitude.max()
+        
+        # 如果所有值都是负数，特殊处理
+        if max_val <= 0:
+            # 将所有负数映射到 [0, 1] 范围
+            normalized = (amplitude - min_val) / (max_val - min_val + self.eps)
+        else:
+            # 正常情况：将整个范围缩放到 [0, 1]
+            normalized = (amplitude - min_val) / (max_val - min_val + self.eps)
+        
+        return normalized
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播。
 
@@ -302,20 +439,48 @@ class ScatterNeuralNetwork(nn.Module):
         B, C, H, W = x.shape
         amplitude = self._image_to_amplitude(x)  # [B, 1, H, W]
 
-        for l in range(self.num_layers):
-            # 展平空间维度
-            b = amplitude.shape[0]
-            amplitude = amplitude.reshape(b, -1)  # [B, H*W], complex
 
-            # 构建复数场：amplitude * exp(i * phase)
-            # polar(abs, angle) -> complex
+        # 卷积
+        # amplitude = self.conv(field)  # [B, 1, H, W]
+
+        # 激活函数
+        # amplitude = self._apply_activation(field)  # [B, 1, H, W]
+
+        # 卷积
+        field = torch.polar(amplitude.float(),torch.zeros_like(amplitude).to(amplitude.device))  # [B, 1, H, W] complex64
+        field = self.conv1(field)  # [B, 1, H, W]
+        amplitude = torch.abs(field)  # [B, 1, H, W]
+        field = torch.polar(amplitude.float(),torch.zeros_like(amplitude).to(amplitude.device))  # [B, 1, H, W] complex64
+        field = self.conv2(field)  # [B, 1, H, W]
+        amplitude = torch.abs(field)  # [B, 1, H, W]
+        field = torch.polar(amplitude.float(),torch.zeros_like(amplitude).to(amplitude.device))  # [B, 1, H, W] complex64
+        field = self.conv3(field)  # [B, 1, H, W]
+        amplitude = torch.abs(field)  # [B, 1, H, W]
+        #再卷两层
+        field = torch.polar(amplitude.float(),torch.zeros_like(amplitude).to(amplitude.device))  # [B, 1, H, W] complex64
+        field = self.conv4(field)  # [B, 1, H, W]
+        amplitude = torch.abs(field)  # [B, 1, H, W]
+        field = torch.polar(amplitude.float(),torch.zeros_like(amplitude).to(amplitude.device))  # [B, 1, H, W] complex64
+        field = self.conv5(field)  # [B, 1, H, W]
+        amplitude = torch.abs(field)  # [B, 1, H, W]
+
+        for l in range(self.num_layers):
+            # print(f"layer {l}")
+            # 构建复数场：amplitude * exp(i * phase_l)
             # torch.polar 对 half CUDA 未实现，这里在极坐标构造处用 float32，然后再按需降精度
-            # 构造复数场，确保为二维 [B, H*W]
-            field_vec = torch.polar(amplitude.float(), self.phase.view(1, -1))  # complex64 [B, H*W]
+            field = torch.polar(amplitude.float(), self.phases[l])  # [B, 1, H, W] complex64
             # 若传输矩阵为 complex32，则将场降到 complex32 以节省显存
             if self.transmission_matrix.dtype == getattr(torch, "complex32", torch.complex64):
-                field_vec = field_vec.to(getattr(torch, "complex32", torch.complex64))
+                field = field.to(getattr(torch, "complex32", torch.complex64))
 
+
+            # field = self.conv3(field)  # [B, 1, H, W]
+            
+            # 散射介质前自由衍射（保持四维）
+            # field = self.prop1(field)  # [B, 1, H, W]
+
+            # 展平到向量后进行传输矩阵乘法
+            field_vec = field.reshape(B, -1)  # [B, H*W]
 
 
             # 复数矩阵乘法：
@@ -345,9 +510,17 @@ class ScatterNeuralNetwork(nn.Module):
             else:
                 y = y_local
 
-            amplitude = torch.abs(y)
-            # 重新调整为 [B, 1, H_in, W_in] 以便作为下一层的输入幅度
-            amplitude = amplitude.view(b, self.output_height, self.output_width).unsqueeze(1)
+            # 输出面自由衍射
+            y = y.reshape(B, 1, self.output_height, self.output_width)
+            # y = self.prop2(y)
+
+            # 幅度作为下一层的输入，应用选择的激活函数
+            amplitude = self._apply_activation(y)
+            
+            # 如果启用了负数正则化，对负数部分进行处理
+            if self.normalize_negative:
+                amplitude = self._normalize_negative_values(amplitude)
+            
             if (self.output_height, self.output_width) != (self.height, self.width):
                 amplitude = F.interpolate(
                     amplitude,
